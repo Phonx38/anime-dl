@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""anime-dl: Search and download anime from the terminal."""
+
+import sys
+import os
+import re
+import json
+import subprocess
+import signal
+import ssl
+from urllib.request import Request, urlopen
+from urllib.parse import urlencode, quote
+
+# Bypass SSL verification (macOS Python often lacks certs)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Try rich for pretty output, fall back to plain
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.progress import Progress, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+    from rich.prompt import Prompt, IntPrompt
+    from rich import print as rprint
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
+AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+REFERER = "https://allmanga.to"
+API_BASE = "https://api.allanime.day"
+SITE_BASE = "allanime.day"
+
+# Decoding map from ani-cli
+DECODE_MAP = {
+    "79": "A", "7a": "B", "7b": "C", "7c": "D", "7d": "E", "7e": "F", "7f": "G",
+    "70": "H", "71": "I", "72": "J", "73": "K", "74": "L", "75": "M", "76": "N",
+    "77": "O", "68": "P", "69": "Q", "6a": "R", "6b": "S", "6c": "T", "6d": "U",
+    "6e": "V", "6f": "W", "60": "X", "61": "Y", "62": "Z",
+    "59": "a", "5a": "b", "5b": "c", "5c": "d", "5d": "e", "5e": "f", "5f": "g",
+    "50": "h", "51": "i", "52": "j", "53": "k", "54": "l", "55": "m", "56": "n",
+    "57": "o", "48": "p", "49": "q", "4a": "r", "4b": "s", "4c": "t", "4d": "u",
+    "4e": "v", "4f": "w", "40": "x", "41": "y", "42": "z",
+    "08": "0", "09": "1", "0a": "2", "0b": "3", "0c": "4", "0d": "5", "0e": "6",
+    "0f": "7", "00": "8", "01": "9",
+    "15": "-", "16": ".", "67": "_", "46": "~", "02": ":", "17": "/", "07": "?",
+    "1b": "#", "63": "[", "65": "]", "78": "@", "19": "!", "1c": "$", "1e": "&",
+    "10": "(", "11": ")", "12": "*", "13": "+", "14": ",", "03": ";", "05": "=",
+    "1d": "%",
+}
+
+
+def decode_url(encoded):
+    """Decode allanime's encoded URLs."""
+    result = []
+    for i in range(0, len(encoded), 2):
+        pair = encoded[i:i+2]
+        result.append(DECODE_MAP.get(pair, pair))
+    decoded = "".join(result)
+    return decoded.replace("/clock", "/clock.json")
+
+
+def api_request(variables, query):
+    """Make a request to the allanime API."""
+    params = urlencode({"variables": json.dumps(variables), "query": query})
+    url = f"{API_BASE}/api?{params}"
+    req = Request(url, headers={"User-Agent": AGENT, "Referer": REFERER})
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def search_anime(query, mode="sub"):
+    """Search for anime by name."""
+    variables = {
+        "search": {"allowAdult": False, "allowUnknown": False, "query": query},
+        "limit": 40, "page": 1,
+        "translationType": mode,
+        "countryOrigin": "ALL",
+    }
+    gql = """query($search:SearchInput $limit:Int $page:Int $translationType:VaildTranslationTypeEnumType $countryOrigin:VaildCountryOriginEnumType){shows(search:$search limit:$limit page:$page translationType:$translationType countryOrigin:$countryOrigin){edges{_id name availableEpisodes __typename}}}"""
+    data = api_request(variables, gql)
+    return data.get("data", {}).get("shows", {}).get("edges", [])
+
+
+def get_episode_list(show_id, mode="sub"):
+    """Get list of available episodes for a show."""
+    variables = {"showId": show_id}
+    gql = """query($showId:String!){show(_id:$showId){_id availableEpisodesDetail}}"""
+    data = api_request(variables, gql)
+    detail = data.get("data", {}).get("show", {}).get("availableEpisodesDetail", {})
+    episodes = detail.get(mode, [])
+    # Sort numerically
+    try:
+        episodes.sort(key=lambda x: float(x))
+    except (ValueError, TypeError):
+        episodes.sort()
+    return episodes
+
+
+def get_episode_sources(show_id, ep_no, mode="sub"):
+    """Get source URLs for an episode."""
+    variables = {
+        "showId": show_id,
+        "translationType": mode,
+        "episodeString": str(ep_no),
+    }
+    gql = """query($showId:String!,$translationType:VaildTranslationTypeEnumType!,$episodeString:String!){episode(showId:$showId translationType:$translationType episodeString:$episodeString){episodeString sourceUrls}}"""
+    data = api_request(variables, gql)
+    episode = data.get("data", {}).get("episode", {})
+    source_urls = episode.get("sourceUrls", [])
+
+    sources = {}
+    for src in source_urls:
+        name = src.get("sourceName", "")
+        url = src.get("sourceUrl", "")
+        if url.startswith("--"):
+            url = url[2:]  # strip leading --
+            sources[name] = url
+    return sources
+
+
+def resolve_download_url(encoded_url):
+    """Decode an encoded URL and resolve to a direct download link."""
+    decoded = decode_url(encoded_url)
+    embed_url = f"https://{SITE_BASE}{decoded}"
+    req = Request(embed_url, headers={"User-Agent": AGENT, "Referer": REFERER})
+    try:
+        with urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+        # Extract link from JSON response
+        match = re.search(r'"link"\s*:\s*"([^"]+)"', text)
+        if match:
+            return match.group(1)
+        # Try direct URL patterns
+        match = re.search(r'"file"\s*:\s*"([^"]+)"', text)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def get_download_url(show_id, ep_no, mode="sub"):
+    """Get the best download URL for an episode."""
+    sources = get_episode_sources(show_id, ep_no, mode)
+
+    # Try providers in order of preference
+    for provider in ["S-mp4", "Default", "Yt-mp4", "Luf-Mp4"]:
+        if provider in sources:
+            url = resolve_download_url(sources[provider])
+            if url:
+                return url
+    return None
+
+
+def get_file_size(url):
+    """Get file size via HEAD request. Returns size in bytes or None."""
+    try:
+        req = Request(url, method="HEAD", headers={"User-Agent": AGENT, "Referer": REFERER})
+        with urlopen(req, timeout=10) as resp:
+            size = resp.headers.get("Content-Length")
+            return int(size) if size else None
+    except Exception:
+        return None
+
+
+def format_size(size_bytes):
+    """Format bytes to human readable."""
+    if size_bytes is None:
+        return "unknown"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+def sanitize_filename(name):
+    """Make a string safe for use as a filename."""
+    return re.sub(r'[^\w\s\-.]', '', name).strip().replace(' ', '_')
+
+
+def download_file(url, filepath):
+    """Download a file using aria2c (fast) or fallback to urllib."""
+    if subprocess.run(["which", "aria2c"], capture_output=True).returncode == 0:
+        dirname = os.path.dirname(filepath)
+        basename = os.path.basename(filepath)
+        cmd = [
+            "aria2c",
+            f"--referer={REFERER}",
+            "--check-certificate=false",
+            "--continue",
+            "--summary-interval=1",
+            "-x", "16", "-s", "16",
+            url,
+            "-d", dirname,
+            "-o", basename,
+        ]
+        result = subprocess.run(cmd)
+        return result.returncode == 0
+    else:
+        # Fallback: urllib with progress
+        req = Request(url, headers={"User-Agent": AGENT, "Referer": REFERER})
+        with urlopen(req, timeout=300) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            if HAS_RICH and total:
+                with Progress(
+                    "[progress.description]{task.description}",
+                    BarColumn(), DownloadColumn(), TransferSpeedColumn(), TimeRemainingColumn(),
+                ) as progress:
+                    task = progress.add_task("Downloading", total=total)
+                    with open(filepath, "wb") as f:
+                        while True:
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            progress.update(task, advance=len(chunk))
+            else:
+                with open(filepath, "wb") as f:
+                    downloaded = 0
+                    while True:
+                        chunk = resp.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            pct = downloaded * 100 // total
+                            print(f"\r  {format_size(downloaded)} / {format_size(total)} ({pct}%)", end="", flush=True)
+                    print()
+        return True
+
+
+def print_header(text):
+    if HAS_RICH:
+        console.print(f"\n[bold cyan]{text}[/bold cyan]")
+    else:
+        print(f"\n{text}")
+
+
+def print_error(text):
+    if HAS_RICH:
+        console.print(f"[bold red]{text}[/bold red]")
+    else:
+        print(f"ERROR: {text}")
+
+
+def print_success(text):
+    if HAS_RICH:
+        console.print(f"[bold green]{text}[/bold green]")
+    else:
+        print(text)
+
+
+def print_info(text):
+    if HAS_RICH:
+        console.print(f"[dim]{text}[/dim]")
+    else:
+        print(text)
+
+
+def parse_episode_selection(selection, max_ep):
+    """Parse episode selection like 'all', '1-5', '1,3,7', '5'."""
+    selection = selection.strip().lower()
+    if selection == "all":
+        return list(range(1, max_ep + 1))
+
+    episodes = set()
+    for part in selection.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            try:
+                start, end = int(start), int(end)
+                episodes.update(range(start, end + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                episodes.add(int(part))
+            except ValueError:
+                pass
+
+    return sorted(ep for ep in episodes if 1 <= ep <= max_ep)
+
+
+def prompt_input(message, default=None):
+    """Get user input."""
+    if HAS_RICH:
+        return Prompt.ask(message, default=default)
+    else:
+        suffix = f" [{default}]" if default else ""
+        return input(f"{message}{suffix}: ") or default
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: (print("\nBye!"), sys.exit(0)))
+
+    # Get search query
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+    else:
+        query = prompt_input("Search anime")
+        if not query:
+            print("No query provided.")
+            sys.exit(1)
+
+    # Search
+    print_header(f"Searching for '{query}'...")
+    results = search_anime(query)
+
+    if not results:
+        print_error("No results found.")
+        sys.exit(1)
+
+    # Display results
+    if HAS_RICH:
+        table = Table(title="Search Results")
+        table.add_column("#", style="cyan", width=4)
+        table.add_column("Name", style="white")
+        table.add_column("Sub", style="green", justify="right")
+        table.add_column("Dub", style="yellow", justify="right")
+        for i, anime in enumerate(results, 1):
+            eps = anime.get("availableEpisodes", {})
+            table.add_row(
+                str(i),
+                anime["name"],
+                str(eps.get("sub", 0)),
+                str(eps.get("dub", 0)),
+            )
+        console.print(table)
+    else:
+        print(f"\n{'#':<4} {'Name':<50} {'Sub':>5} {'Dub':>5}")
+        print("-" * 66)
+        for i, anime in enumerate(results, 1):
+            eps = anime.get("availableEpisodes", {})
+            print(f"{i:<4} {anime['name']:<50} {eps.get('sub', 0):>5} {eps.get('dub', 0):>5}")
+
+    # Select anime
+    choice = prompt_input("\nSelect anime #")
+    try:
+        idx = int(choice) - 1
+        selected = results[idx]
+    except (ValueError, IndexError):
+        print_error("Invalid selection.")
+        sys.exit(1)
+
+    show_id = selected["_id"]
+    show_name = selected["name"]
+    print_header(f"Selected: {show_name}")
+
+    # Get episodes
+    episodes = get_episode_list(show_id)
+    if not episodes:
+        print_error("No episodes available.")
+        sys.exit(1)
+
+    print_info(f"{len(episodes)} episodes available (sub)")
+
+    # Get sizes for episodes
+    print_info("Fetching episode sizes...")
+    ep_info = []
+    for ep in episodes:
+        url = get_download_url(show_id, ep)
+        size = get_file_size(url) if url else None
+        ep_info.append({"ep": ep, "url": url, "size": size})
+        status = format_size(size) if size else ("no source" if not url else "unknown size")
+        if HAS_RICH:
+            console.print(f"  Episode {ep:>3}: {status}")
+        else:
+            print(f"  Episode {ep:>3}: {status}")
+
+    total_size = sum(e["size"] for e in ep_info if e["size"])
+    print_header(f"Total size (estimated): {format_size(total_size)}")
+
+    # Select episodes
+    selection = prompt_input(
+        f"\nDownload episodes (all, 1-{len(episodes)}, 1,3,5, or single #)",
+        default="all"
+    )
+    selected_eps = parse_episode_selection(selection, len(episodes))
+
+    if not selected_eps:
+        print_error("No valid episodes selected.")
+        sys.exit(1)
+
+    # Calculate download size
+    dl_info = [ep_info[i-1] for i in selected_eps]
+    dl_size = sum(e["size"] for e in dl_info if e["size"])
+    print_info(f"\nWill download {len(selected_eps)} episode(s) ({format_size(dl_size)})")
+
+    # Confirm
+    confirm = prompt_input("Start download? (y/n)", default="y")
+    if confirm.lower() not in ("y", "yes"):
+        print("Cancelled.")
+        sys.exit(0)
+
+    # Download
+    safe_name = sanitize_filename(show_name)
+    download_dir = os.path.expanduser(f"~/Downloads/{safe_name}")
+    os.makedirs(download_dir, exist_ok=True)
+    print_header(f"Downloading to {download_dir}")
+
+    success = 0
+    failed = 0
+    skipped = 0
+
+    for info in dl_info:
+        ep = info["ep"]
+        url = info["url"]
+        filename = f"{safe_name}_E{str(ep).zfill(2)}.mp4"
+        filepath = os.path.join(download_dir, filename)
+
+        if os.path.exists(filepath):
+            existing_size = os.path.getsize(filepath)
+            if info["size"] and abs(existing_size - info["size"]) < 1024:
+                print_info(f"  [SKIP] Episode {ep} already downloaded")
+                skipped += 1
+                continue
+
+        if not url:
+            print_error(f"  [FAIL] Episode {ep}: no source found")
+            failed += 1
+            continue
+
+        print_info(f"\n  Downloading Episode {ep} ({format_size(info['size'])})...")
+        try:
+            if download_file(url, filepath):
+                print_success(f"  [DONE] Episode {ep}")
+                success += 1
+            else:
+                print_error(f"  [FAIL] Episode {ep}")
+                failed += 1
+        except Exception as e:
+            print_error(f"  [FAIL] Episode {ep}: {e}")
+            failed += 1
+
+    # Summary
+    print_header("Download Summary")
+    print_success(f"  Downloaded: {success}")
+    if skipped:
+        print_info(f"  Skipped:    {skipped}")
+    if failed:
+        print_error(f"  Failed:     {failed}")
+    print_info(f"  Location:   {download_dir}")
+
+
+if __name__ == "__main__":
+    main()
