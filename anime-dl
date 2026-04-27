@@ -63,10 +63,18 @@ def decode_url(encoded):
 
 def api_request(variables, query):
     """Make a request to the allanime API."""
-    params = urlencode({"variables": json.dumps(variables), "query": query})
-    url = f"{API_BASE}/api?{params}"
-    req = Request(url, headers={"User-Agent": AGENT, "Referer": REFERER})
-    with urlopen(req, timeout=5) as resp:
+    body = json.dumps({"variables": variables, "query": query}).encode()
+    req = Request(
+        f"{API_BASE}/api",
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": AGENT,
+            "Referer": REFERER,
+            "Content-Type": "application/json",
+        },
+    )
+    with urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
 
 
